@@ -39,7 +39,9 @@ import Data.Primitive hiding (sizeOf)
 import qualified Data.Primitive as Prim
 import Foreign.Ptr
 import Foreign.ForeignPtr
+import qualified Foreign.Marshal.Unsafe as UF
 import Foreign.Marshal.Utils (copyBytes)
+import qualified Foreign.Marshal.Array  as MA (mallocArray, copyArray)
 import Test.QuickCheck.Gen (frequency)
 
 import qualified Data.Vector.Unboxed as VU
@@ -374,7 +376,7 @@ instance Prim r => Streamable (UVector (sym::Symbol) r) Int r where
                         fillUV arr i' pos = case next i' of
                                          Yield x i'' -> writeByteArray arr pos x >> fillUV arr i'' (pos+1)
                                          Skip i''    -> fillUV arr i'' (pos+1)
-                                         Done        -> return i'
+                                         Done        -> return pos
 
 instance Prim r => Streamable (MutableByteArray RealWorld, Int) Int r where
         {-# INLINABLE[0] stream #-}
@@ -394,7 +396,7 @@ instance Prim r => Streamable (MutableByteArray RealWorld, Int) Int r where
                         fillUV arr i' pos = case next i' of
                                          Yield x i'' -> writeByteArray arr pos x >> fillUV arr i'' (pos+1)
                                          Skip i''    -> fillUV arr i'' (pos+1)
-                                         Done        -> return i'
+                                         Done        -> return pos
 
 instance (Prim r, r ~ Scalar r) => Recycleable IO (MutableByteArray RealWorld, Int) (UVector (sym::Symbol) r) where
         {-# INLINE new #-}
@@ -448,7 +450,7 @@ instance Prim r => Fillable IO (MutableByteArray RealWorld, Int) Int r where
                         fillUV arr i' pos = case next i' of
                                          Yield x i'' -> writeByteArray arr pos x >> fillUV arr i'' (pos+1)
                                          Skip i''    -> fillUV arr i'' (pos+1)
-                                         Done        -> return i'
+                                         Done        -> return pos
 
 instance (Prim r, r ~ Scalar r) => RMStreams IO (UVector (sym::Symbol) r) (MutableByteArray RealWorld, Int) Int r
 
@@ -960,6 +962,91 @@ instance (FreeModule r, Eq r, ValidSVector n r, ValidScalar r) => FiniteModule (
             go p (x:xs') i = do
                 pokeElemOff p i x
                 go p xs' (i-1)
+
+----------------------------------------
+-- Stream-Fusion/Recycling
+
+instance Storable r => Streamable (SVector (sym::Symbol) r) Int r where
+        {-# INLINABLE[0] stream #-}
+        stream (SVector_Dynamic fp _ n) = Stream next 0 n
+                where
+                        next i
+                          | i < n     = Yield (UF.unsafeLocalState $ withForeignPtr fp $ \ptr -> peekElemOff ptr i) (i+1)
+                          | otherwise = Done
+        {-# INLINABLE[0] unstream #-}
+        unstream (Stream next i n) = UF.unsafeLocalState $ do
+                        v <- mallocForeignPtrArray n
+                        ent <- withForeignPtr v $ \fp -> fillUV fp i 0
+                        when (ent >= n) (error $ "tried to stream more than " + show n + " elements into " + show n + "-dim Vector.") -- impossible if types are correct!
+                                                                                                                                      -- abort as we have corrupted the memory anyways..
+                        return (SVector_Dynamic v 0 n)
+                where
+                        fillUV ptr i' pos = case next i' of
+                                         Yield x i'' -> pokeElemOff ptr pos x >> fillUV ptr i'' (pos+1)
+                                         Skip i''    -> fillUV ptr i'' (pos+1)
+                                         Done        -> return pos
+
+instance Storable r => Streamable (Ptr r, Int) Int r where
+        {-# INLINABLE[0] stream #-}
+        stream (marr, n) = Stream next 0 n
+                where
+                        next i
+                          | i < n     = Yield (UF.unsafeLocalState $ peekElemOff marr i) (i+1)
+                          | otherwise = Done
+        {-# INLINABLE[0] unstream #-}
+        unstream (Stream next i n) = UF.unsafeLocalState $ do
+                        marr <- MA.mallocArray n
+                        ent <- fillUV marr i 0
+                        when (ent >= n) (error $ "tried to stream more than " + show n + " elements into " + show n + "-dim Vector.") -- impossible if types are correct!
+                                                                                                                                      -- abort as we have corrupted the memory anyways..
+                        return (marr, n)
+                where
+                        fillUV arr i' pos = case next i' of
+                                         Yield x i'' -> pokeElemOff arr pos x >> fillUV arr i'' (pos+1)
+                                         Skip i''    -> fillUV arr i'' (pos+1)
+                                         Done        -> return pos
+
+instance (Storable r, r ~ Scalar r) => Recycleable IO (Ptr r, Int) (SVector (sym::Symbol) r) where
+        {-# INLINE new #-}
+        new = newSVec
+        {-# INLINE clone #-}
+        clone = cloneSVec
+
+{-# INLINE[0] newSVec #-}
+newSVec :: forall (n :: Symbol) r. New IO (Ptr r, Int) -> SVector n r
+newSVec (New init) = UF.unsafeLocalState $ do
+                                (ptr, n) <- init
+                                fp <- newForeignPtr_ ptr
+                                return $ SVector_Dynamic fp 0 n
+
+{-# INLINE[0] cloneSVec #-}
+cloneSVec :: forall r sym.(Storable r, r ~ Scalar r) => SVector (sym::Symbol) r -> New IO (Ptr r, Int)
+cloneSVec (SVector_Dynamic a off n) = New $ do
+                                    p <- MA.mallocArray n
+                                    withForeignPtr a $ \ptr1 -> do
+                                        MA.copyArray p (plusPtr ptr1 off) n
+                                    return (p,n)
+
+{-# RULES
+"clone/new [SVector]"[~0] forall p. cloneSVec (newSVec p) = p
+  #-}
+
+
+instance Storable r => Fillable IO (Ptr r, Int) Int r where
+        {-# INLINABLE[0] fill #-}
+        fill (Stream next i n) = New $ do
+                        arr <- MA.mallocArray n
+                        ent <- fillUV arr i 0
+                        when (ent >= n) (error $ "tried to stream more than " + show n + " elements into " + show n + "-dim Vector.") -- impossible if types are correct!
+                                                                                                                                      -- abort as we have corrupted the memory anyways..
+                        return (arr,n)
+                where
+                        fillUV arr i' pos = case next i' of
+                                         Yield x i'' -> pokeElemOff arr pos x >> fillUV arr i'' (pos+1)
+                                         Skip i''    -> fillUV arr i'' (pos+1)
+                                         Done        -> return pos
+
+instance (Storable r, r ~ Scalar r) => RMStreams IO (SVector (sym::Symbol) r) (Ptr r, Int) Int r
 
 ----------------------------------------
 -- comparison

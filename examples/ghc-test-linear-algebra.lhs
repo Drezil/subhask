@@ -25,3 +25,15 @@
 >   putStrLn $ " v' = " + show v'
 >   w' <- return $ v' & (1 !~ 42) . (2 %~ (+5)) . (1 !~ 5) . (3 !~ 0) . (1 !~ 0) . (1 !~ 42)
 >   putStrLn  $ " w' = " + show w'
+>
+>   let sv = unsafeToModule [1..5] :: SVector "foo" Double
+>
+>   putStrLn $ " sv = " + show sv
+>   sw <- return $ sv & (3 !~ 0)
+>   putStrLn  $ " sw = " + show sw
+>
+>
+>   let sv' = unsafeToModule [1..5] :: SVector "bar" Double
+>   putStrLn $ " sv' = " + show sv'
+>   sw' <- return $ sv' & (1 !~ 42) . (2 %~ (+5)) . (1 !~ 5) . (3 !~ 0) . (1 !~ 0) . (1 !~ 42)
+>   putStrLn  $ " w' = " + show sw'
